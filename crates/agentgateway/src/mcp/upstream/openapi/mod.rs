@@ -238,6 +238,56 @@ fn resolve_request_body<'a>(
 	}
 }
 
+fn resolve_response<'a>(
+	reference: &'a ReferenceOr<openapiv3::Response>,
+	doc: &'a OpenAPI,
+) -> Result<&'a openapiv3::Response, ParseError> {
+	match reference {
+		ReferenceOr::Reference { reference } => {
+			let reference = reference
+				.strip_prefix("#/components/responses/")
+				.ok_or(ParseError::InvalidReference(reference.to_string()))?;
+			let components: &openapiv3::Components = doc
+				.components
+				.as_ref()
+				.ok_or(ParseError::MissingComponents)?;
+			let response = components
+				.responses
+				.get(reference)
+				.ok_or(ParseError::MissingReference(reference.to_string()))?;
+			resolve_response(response, doc)
+		},
+		ReferenceOr::Item(response) => Ok(response),
+	}
+}
+
+/// Extracts a JSON Schema object from the OpenAPI operation's success response,
+/// suitable for use as the MCP tool's `output_schema`.
+fn extract_output_schema(responses: &openapiv3::Responses, doc: &OpenAPI) -> Option<JsonObject> {
+	// Pick success response: prefer 200, then 201, then first 2xx, then default
+	let response_ref = [200u16, 201]
+		.iter()
+		.find_map(|code| responses.responses.get(&openapiv3::StatusCode::Code(*code)))
+		.or_else(|| {
+			responses
+				.responses
+				.iter()
+				.find_map(|(code, resp)| match code {
+					openapiv3::StatusCode::Code(c) if (200..300).contains(c) => Some(resp),
+					_ => None,
+				})
+		})
+		.or(responses.default.as_ref())?;
+
+	let response = resolve_response(response_ref, doc).ok()?;
+	let media_type = response.content.get("application/json")?;
+	let schema_ref = media_type.schema.as_ref()?;
+
+	let resolved = resolve_nested_schema(schema_ref, doc).ok()?;
+	let value = serde_json::to_value(resolved).ok()?;
+	value.as_object().cloned()
+}
+
 /// We need to rework this and I don't want to forget.
 ///
 /// We need to be able to handle data which can end up in multiple destinations:
@@ -385,8 +435,7 @@ pub(crate) fn parse_openapi_schema(
 										.to_string(),
 								)),
 								input_schema: Arc::new(final_json),
-								// TODO: support output_schema
-								output_schema: None,
+								output_schema: extract_output_schema(&op.responses, open_api).map(Arc::new),
 								icons: None,
 								title: None,
 							};

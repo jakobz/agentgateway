@@ -1143,3 +1143,254 @@ async fn test_openapi_from_url() {
 		}
 	}
 }
+
+#[test]
+fn test_output_schema_from_openapi_responses() {
+	let openapi: openapiv3::OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": { "title": "Test", "version": "1.0.0" },
+		"paths": {
+			"/pets": {
+				"get": {
+					"operationId": "listPets",
+					"responses": {
+						"200": {
+							"description": "A list of pets",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "array",
+										"items": {
+											"type": "object",
+											"properties": {
+												"id": { "type": "integer" },
+												"name": { "type": "string" }
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			},
+			"/pets/{petId}": {
+				"get": {
+					"operationId": "getPet",
+					"parameters": [{
+						"name": "petId",
+						"in": "path",
+						"required": true,
+						"schema": { "type": "string" }
+					}],
+					"responses": {
+						"200": {
+							"description": "A single pet",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "object",
+										"properties": {
+											"id": { "type": "integer" },
+											"name": { "type": "string" },
+											"tag": { "type": "string" }
+										},
+										"required": ["id", "name"]
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}))
+	.unwrap();
+
+	let tools = super::parse_openapi_schema(&openapi).unwrap();
+
+	let list_tool = tools.iter().find(|(t, _)| t.name == "listPets").unwrap();
+	let output = list_tool
+		.0
+		.output_schema
+		.as_ref()
+		.expect("listPets should have output_schema");
+	assert_eq!(output.get("type").and_then(|v| v.as_str()), Some("array"));
+	assert!(output.contains_key("items"));
+
+	let get_tool = tools.iter().find(|(t, _)| t.name == "getPet").unwrap();
+	let output = get_tool
+		.0
+		.output_schema
+		.as_ref()
+		.expect("getPet should have output_schema");
+	assert_eq!(output.get("type").and_then(|v| v.as_str()), Some("object"));
+	let props = output
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.unwrap();
+	assert!(props.contains_key("id"));
+	assert!(props.contains_key("name"));
+	assert!(props.contains_key("tag"));
+	let required = output.get("required").and_then(|v| v.as_array()).unwrap();
+	assert!(required.contains(&json!("id")));
+	assert!(required.contains(&json!("name")));
+}
+
+#[test]
+fn test_output_schema_none_when_no_response_schema() {
+	let openapi: openapiv3::OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": { "title": "Test", "version": "1.0.0" },
+		"paths": {
+			"/ping": {
+				"get": {
+					"operationId": "ping",
+					"responses": {
+						"204": {
+							"description": "No content"
+						}
+					}
+				}
+			}
+		}
+	}))
+	.unwrap();
+
+	let tools = super::parse_openapi_schema(&openapi).unwrap();
+	let ping_tool = tools.iter().find(|(t, _)| t.name == "ping").unwrap();
+	assert!(
+		ping_tool.0.output_schema.is_none(),
+		"ping should have no output_schema when response has no content"
+	);
+}
+
+#[test]
+fn test_output_schema_with_ref_response() {
+	let openapi: openapiv3::OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": { "title": "Test", "version": "1.0.0" },
+		"paths": {
+			"/users": {
+				"get": {
+					"operationId": "listUsers",
+					"responses": {
+						"200": {
+							"$ref": "#/components/responses/UserListResponse"
+						}
+					}
+				}
+			}
+		},
+		"components": {
+			"responses": {
+				"UserListResponse": {
+					"description": "A list of users",
+					"content": {
+						"application/json": {
+							"schema": {
+								"type": "array",
+								"items": {
+									"$ref": "#/components/schemas/User"
+								}
+							}
+						}
+					}
+				}
+			},
+			"schemas": {
+				"User": {
+					"type": "object",
+					"properties": {
+						"id": { "type": "integer" },
+						"email": { "type": "string" }
+					},
+					"required": ["id", "email"]
+				}
+			}
+		}
+	}))
+	.unwrap();
+
+	let tools = super::parse_openapi_schema(&openapi).unwrap();
+	let list_tool = tools.iter().find(|(t, _)| t.name == "listUsers").unwrap();
+	let output = list_tool
+		.0
+		.output_schema
+		.as_ref()
+		.expect("listUsers should have output_schema from $ref response");
+
+	assert_eq!(output.get("type").and_then(|v| v.as_str()), Some("array"));
+	let items = output.get("items").and_then(|v| v.as_object()).unwrap();
+	assert_eq!(items.get("type").and_then(|v| v.as_str()), Some("object"));
+	let props = items.get("properties").and_then(|v| v.as_object()).unwrap();
+	assert!(props.contains_key("id"));
+	assert!(props.contains_key("email"));
+}
+
+#[test]
+fn test_output_schema_prefers_200_over_201() {
+	let openapi: openapiv3::OpenAPI = serde_json::from_value(json!({
+		"openapi": "3.0.0",
+		"info": { "title": "Test", "version": "1.0.0" },
+		"paths": {
+			"/items": {
+				"post": {
+					"operationId": "createItem",
+					"requestBody": {
+						"content": {
+							"application/json": {
+								"schema": {
+									"type": "object",
+									"properties": { "name": { "type": "string" } }
+								}
+							}
+						}
+					},
+					"responses": {
+						"200": {
+							"description": "OK response",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "object",
+										"properties": {
+											"from200": { "type": "boolean" }
+										}
+									}
+								}
+							}
+						},
+						"201": {
+							"description": "Created response",
+							"content": {
+								"application/json": {
+									"schema": {
+										"type": "object",
+										"properties": {
+											"from201": { "type": "boolean" }
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}))
+	.unwrap();
+
+	let tools = super::parse_openapi_schema(&openapi).unwrap();
+	let tool = tools.iter().find(|(t, _)| t.name == "createItem").unwrap();
+	let output = tool
+		.0
+		.output_schema
+		.as_ref()
+		.expect("should have output_schema");
+	let props = output
+		.get("properties")
+		.and_then(|v| v.as_object())
+		.unwrap();
+	assert!(props.contains_key("from200"), "should prefer 200 over 201");
+}
